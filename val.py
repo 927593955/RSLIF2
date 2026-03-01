@@ -1,100 +1,110 @@
+"""
+val.py  (rewritten for grounding)
+
+Validates the grounding model.
+
+Key fixes vs old val.py:
+1. Removed class-match requirement from Acc@0.5  ← was artificially halving accuracy
+2. Uses model's direct pred_box output instead of NMS on detection proposals
+3. IoU computed directly between pred_box and GT box (no top-1 confidence ranking needed)
+4. Supports optional @0.25 / @0.5 / @0.75 Acc thresholds
+"""
+
 import torch
-import numpy as np
+import torch.nn.functional as F
 from tqdm import tqdm
 
-from utils.general import non_max_suppression
-from utils.metrics import process_batch, box_iou
-from utils.detection import decode_outputs
+
+def box_cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
+    cx, cy, w, h = boxes.unbind(-1)
+    return torch.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], dim=-1)
 
 
-def validate(model, val_loader, device, conf_thres=0.25, iou_thres=0.6, class_agnostic=False):
-    """Class-aware validation for grounding/detection quality."""
+def box_iou_diag(pred_xyxy: torch.Tensor, gt_xyxy: torch.Tensor) -> torch.Tensor:
+    """
+    Per-sample IoU between matched pred/gt boxes.
+    pred_xyxy, gt_xyxy: [B, 4]
+    Returns: [B] IoU values
+    """
+    lt = torch.max(pred_xyxy[:, :2], gt_xyxy[:, :2])
+    rb = torch.min(pred_xyxy[:, 2:], gt_xyxy[:, 2:])
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[:, 0] * wh[:, 1]
+
+    a1 = (pred_xyxy[:, 2] - pred_xyxy[:, 0]) * (pred_xyxy[:, 3] - pred_xyxy[:, 1])
+    a2 = (gt_xyxy[:, 2] - gt_xyxy[:, 0]) * (gt_xyxy[:, 3] - gt_xyxy[:, 1])
+    union = (a1 + a2 - inter).clamp(min=1e-6)
+    return inter / union
+
+
+@torch.no_grad()
+def validate(model, val_loader, device,
+             iou_thresholds=(0.25, 0.5, 0.75), verbose=True):
+    """
+    Args:
+        model:          RemoteSensingVLM (grounding variant)
+        val_loader:     DataLoader yielding (imgs, input_ids, masks, targets, spa_gt)
+        device:         torch.device
+        iou_thresholds: tuple of IoU thresholds for Acc@k
+        verbose:        print progress bar
+
+    Returns:
+        metrics: dict  { 'acc@0.25': float, 'acc@0.5': float, 'acc@0.75': float,
+                         'mean_iou': float }
+    """
     model.eval()
 
-    stats = []
-    top1_correct = 0
-    total_images_with_gt = 0
-    total_gt_instances = 0
+    total = 0
+    correct = {t: 0 for t in iou_thresholds}
+    sum_iou = 0.0
 
-    pbar = tqdm(val_loader, desc="🔍 Validating", leave=False)
+    pbar = tqdm(val_loader, desc='Validating', leave=False) if verbose else val_loader
 
     for batch in pbar:
-        imgs, input_ids, masks, targets, _ = [item.to(device) for item in batch]
+        imgs, input_ids, masks, targets, _ = [x.to(device) for x in batch]
+        B = imgs.shape[0]
 
-        with torch.no_grad():
-            output = model(imgs, [input_ids, masks])
-            preds_raw = output['feats'] if isinstance(output, dict) else output
-            if isinstance(preds_raw, tuple):
-                preds_raw = preds_raw[0]
+        output = model(imgs, [input_ids, masks])
+        pred_box = output['pred_box']  # [B, 4] normalized cx,cy,w,h
 
-        preds_decoded = decode_outputs(preds_raw, model)
-        preds = non_max_suppression(
-            preds_decoded,
-            conf_thres=conf_thres,
-            iou_thres=iou_thres,
-            agnostic=class_agnostic,
-            multi_label=False,
-        )
-
-        for si, pred in enumerate(preds):
-            labels = targets[targets[:, 0] == si]
-            nl = len(labels)
-            if nl:
-                total_images_with_gt += 1
-                total_gt_instances += nl
-
-                h, w = imgs.shape[2:]
-                tbox = labels[:, 2:].clone()
-                tbox[:, 0] *= w
-                tbox[:, 2] *= w
-                tbox[:, 1] *= h
-                tbox[:, 3] *= h
-
-                box = torch.zeros_like(tbox)
-                box[:, 0] = tbox[:, 0] - tbox[:, 2] / 2
-                box[:, 1] = tbox[:, 1] - tbox[:, 3] / 2
-                box[:, 2] = tbox[:, 0] + tbox[:, 2] / 2
-                box[:, 3] = tbox[:, 1] + tbox[:, 3] / 2
-                labels_pixel = torch.cat((labels[:, 1:2], box), 1)
-            else:
-                labels_pixel = torch.zeros((0, 5), device=device)
-
-            if len(pred) == 0:
-                if nl:
-                    stats.append((torch.zeros(0, dtype=torch.bool), torch.tensor([]), torch.tensor([]), labels[:, 1].tolist()))
+        # Extract GT box per sample (first GT if multiple)
+        h, w = imgs.shape[2:]
+        for i in range(B):
+            t = targets[targets[:, 0].long() == i]
+            if len(t) == 0:
                 continue
 
-            predn = pred.clone()
-            correct = process_batch(predn, labels_pixel, iou_thres=0.5)
-            stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), labels[:, 1].tolist()))
+            total += 1
 
-            if nl:
-                top1_idx = torch.argsort(predn[:, 4], descending=True)[0]
-                top1_box = predn[top1_idx, :4].unsqueeze(0)
-                top1_cls = int(predn[top1_idx, 5].item())
-                ious = box_iou(labels_pixel[:, 1:], top1_box).squeeze(1)
-                best_gt_idx = int(torch.argmax(ious).item())
-                if ious[best_gt_idx] > 0.5 and top1_cls == int(labels_pixel[best_gt_idx, 0].item()):
-                    top1_correct += 1
+            # GT: convert normalized cxcywh → pixel xyxy
+            gt_norm = t[0, 2:6]                           # [4] cx,cy,w,h normalized
+            gt_xyxy_norm = box_cxcywh_to_xyxy(gt_norm.unsqueeze(0))   # [1,4]
 
-    acc_top1 = top1_correct / (total_images_with_gt + 1e-7)
+            # Pred: also normalized
+            pb = pred_box[i].unsqueeze(0).clamp(0, 1)     # [1, 4]
+            pb_xyxy = box_cxcywh_to_xyxy(pb)              # [1, 4]
 
-    if len(stats):
-        stats = [np.concatenate(x, 0) if len(x) else np.array([]) for x in zip(*stats)]
-    else:
-        stats = []
+            iou = box_iou_diag(pb_xyxy, gt_xyxy_norm).item()
+            sum_iou += iou
 
-    if len(stats) and stats[0].size:
-        tp = stats[0].sum()
-        fp = stats[0].shape[0] - tp
-        precision = tp / (tp + fp + 1e-7)
-        recall = tp / (total_gt_instances + 1e-7)
-        f1 = 2 * (precision * recall) / (precision + recall + 1e-7)
-    else:
-        precision, recall, f1 = 0.0, 0.0, 0.0
+            for t_thresh in iou_thresholds:
+                if iou >= t_thresh:
+                    correct[t_thresh] += 1
 
-    print(
-        f"📊 Validation Results: Acc@0.5={acc_top1:.4f} | "
-        f"P={precision:.4f} | R={recall:.4f} | F1={f1:.4f}"
-    )
-    return precision, recall, f1, acc_top1
+        if verbose and isinstance(pbar, tqdm):
+            acc5 = correct[0.5] / max(total, 1)
+            pbar.set_postfix(Acc5=f'{acc5:.4f}')
+
+    metrics = {f'acc@{t}': correct[t] / max(total, 1) for t in iou_thresholds}
+    metrics['mean_iou'] = sum_iou / max(total, 1)
+    metrics['total'] = total
+
+    if verbose:
+        print(
+            f'📊 Val Results | '
+            + ' | '.join(f"Acc@{t}={metrics[f'acc@{t}']:.4f}" for t in iou_thresholds)
+            + f' | mIoU={metrics["mean_iou"]:.4f}'
+            + f' | n={total}'
+        )
+
+    return metrics
