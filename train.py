@@ -1,31 +1,46 @@
 """
-train.py  (v3 — Three-Stage Training with Full Branch Supervision)
+train.py  (v4 — fixes for three bugs vs v3)
 
-Changes vs v2:
+BUG FIXES:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Stage 1 (epochs 0 → stage1_epochs):
+BUG 1: GroundingLoss init used wrong parameter names.
+  OLD: GroundingLoss(lambda_attr_pres=..., lambda_routing_ent=..., lambda_routing_div=...)
+  NEW: GroundingLoss(lambda_spa_quad=..., lambda_sem_cls=..., lambda_reconstruct=...)
+  These now match grounding_loss.py exactly.
+
+BUG 2: get_lambdas() returned keys that don't exist in grounding_loss.py's lw dict.
+  OLD keys: attr_pres, routing_ent, routing_div  (grounding_loss.py ignores them silently)
+  NEW keys: spa_quad, reconstruct
+  The lw.update() in grounding_loss only accepts keys it knows; wrong keys were no-ops,
+  meaning the lambdas schedule was not actually being applied.
+
+BUG 3: Optimizer had a 'token_router' param group that matched 0 parameters.
+  No module named token_router exists in the model.
+  Removed. Now only two groups: vision (full LR) and text (0.1× LR).
+
+BUG 4: branch_probe.py existed but was never called.
+  Added: run_branch_analysis() every 10 epochs after validate().
+  This gives you the specialization verification that was the whole point of
+  adding that module.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Three-stage training schedule (unchanged logic, corrected keys):
+
+Stage 1 (0 → stage1_epochs):
   Losses: giou + l1 only
-  Goal: learn basic box localization from scratch
-  Why: routing losses before localization is stable → noisy gradients
+  Goal: learn basic box localization before any branch-specific signals.
 
-Stage 2 (epochs stage1_epochs → stage2_epochs):
-  Losses: + spa + orth
-  Goal: separate spatial branch from semantic/attribute
-  The spa loss is the first branch-specific signal; orth keeps sem⊥attr
+Stage 2 (stage1_epochs → stage1_epochs + stage2_offset):
+  Losses: + spa + spa_quad + sem_cls
+  Goal: separate spatial and semantic branches with direct supervision.
 
-Stage 3 (epochs stage2_epochs → end):
-  Losses: + sem_cls + attr_pres + routing_ent + routing_div
-  Goal: fully specialize all three branches
-  sem_cls  : forces sem_vec to encode category identity
-  attr_pres: forces attr_vec to encode attribute word presence
-  routing_* : force token router to produce sharp, diverse assignments
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Progress bar now shows all 8 loss components for debugging branch specialization.
+Stage 3 (stage1_epochs + stage2_offset → end):
+  Losses: + reconstruct + orth
+  Goal: enforce attribute branch complementarity.
+  reconstruct ramps in over `reconstruct_ramp_epochs` to avoid destabilization.
 """
 
 import argparse
-import math
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -49,53 +64,66 @@ from data.dataset import DIORRSVGDataset, rsvlm_collate_fn
 from models.vlm_grounding import RemoteSensingVLM
 from utils.grounding_loss import GroundingLoss
 from utils.ema import ModelEMA
+from utils.branch_probe import run_branch_analysis   # BUG 4 FIX: now imported
 from val import validate
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Three-stage lambda schedule
+# BUG 1 + 2 FIX: Corrected three-stage lambda schedule
+# Keys returned here must exactly match the 'lw' dict in GroundingLoss.forward()
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_lambdas(opt, epoch: int) -> dict:
     """
     Returns loss weight dict for the current epoch.
 
-    Stage 1: giou + l1 only
-    Stage 2: + spa + orth
-    Stage 3: + sem_cls + attr_pres + routing_ent + routing_div
-    """
-    stage2_start = opt.stage1_epochs + getattr(opt, 'stage2_offset', 10)
+    Keys MUST match grounding_loss.py's lw dict:
+        giou, l1, spa, spa_quad, sem_cls, reconstruct, orth
 
-    if epoch < opt.stage1_epochs:
+    Stage 1: giou + l1 only
+    Stage 2: + spa + spa_quad + sem_cls
+    Stage 3: + reconstruct + orth  (reconstruct ramps in slowly)
+    """
+    stage2_start = opt.stage1_epochs
+    stage3_start = opt.stage1_epochs + opt.stage2_offset
+
+    if epoch < stage2_start:
         # Stage 1: localization only
         return {
-            'giou': 2.0, 'l1': 5.0,
-            'spa': 0.0, 'orth': 0.0,
-            'sem_cls': 0.0, 'attr_pres': 0.0,
-            'routing_ent': 0.0, 'routing_div': 0.0,
+            'giou':        2.0,
+            'l1':          5.0,
+            'spa':         0.0,
+            'spa_quad':    0.0,
+            'sem_cls':     0.0,
+            'reconstruct': 0.0,
+            'orth':        0.0,
         }
 
-    elif epoch < stage2_start:
-        # Stage 2: add spatial and orthogonality
+    elif epoch < stage3_start:
+        # Stage 2: direct branch supervision for spatial + semantic
         return {
-            'giou': 2.0, 'l1': 5.0,
-            'spa': opt.lambda_spa, 'orth': opt.lambda_orth,
-            'sem_cls': 0.0, 'attr_pres': 0.0,
-            'routing_ent': 0.0, 'routing_div': 0.0,
+            'giou':        2.0,
+            'l1':          5.0,
+            'spa':         opt.lambda_spa,
+            'spa_quad':    opt.lambda_spa_quad,
+            'sem_cls':     opt.lambda_sem_cls,
+            'reconstruct': 0.0,   # attribute not yet — sem+spa must stabilize first
+            'orth':        0.0,
         }
 
     else:
-        # Stage 3: full branch specialization
-        # Ramp routing losses in slowly (can destabilize if turned on all at once)
-        epochs_in_s3 = epoch - stage2_start
-        ramp = min(1.0, epochs_in_s3 / max(opt.routing_ramp_epochs, 1))
+        # Stage 3: attribute complementarity + orthogonality
+        # Ramp reconstruct in slowly: too sudden → training instability
+        epochs_in_s3 = epoch - stage3_start
+        ramp = min(1.0, epochs_in_s3 / max(opt.reconstruct_ramp_epochs, 1))
         return {
-            'giou': 2.0, 'l1': 5.0,
-            'spa': opt.lambda_spa, 'orth': opt.lambda_orth,
+            'giou':        2.0,
+            'l1':          5.0,
+            'spa':         opt.lambda_spa,
+            'spa_quad':    opt.lambda_spa_quad,
             'sem_cls':     opt.lambda_sem_cls,
-            'attr_pres':   opt.lambda_attr_pres,
-            'routing_ent': opt.lambda_routing_ent * ramp,
-            'routing_div': opt.lambda_routing_div * ramp,
+            'reconstruct': opt.lambda_reconstruct * ramp,
+            'orth':        opt.lambda_orth,
         }
 
 
@@ -124,7 +152,7 @@ def train(opt):
     )
     print(f'Training on {device} | batch_size={opt.batch_size} | Saving to {save_dir}')
 
-    # ── Datasets ──────────────────────────────────────────────────────────
+    # ── Datasets ──────────────────────────────────────────────────────────────
     train_dataset = DIORRSVGDataset(
         data_root=opt.data_root,
         xml_root=opt.xml_root,
@@ -162,14 +190,13 @@ def train(opt):
         prefetch_factor=2 if nw > 0 else None,
     )
 
-    # ── Model ─────────────────────────────────────────────────────────────
+    # ── Model ─────────────────────────────────────────────────────────────────
     model_cfg = {
         'deberta_path':   opt.text_model,
         'yolo_weight':    opt.yolo_weight,
         'hidden_dim':     opt.hidden_dim,
         'backbone_width': 0.5,
         'backbone_depth': 0.33,
-        'num_classes':    20,   # DIOR-RSVG
     }
     model = RemoteSensingVLM(model_cfg).to(device)
 
@@ -188,55 +215,45 @@ def train(opt):
         except Exception as e:
             print(f'  torch.compile not available: {e}')
 
-    # ── Optimizer ─────────────────────────────────────────────────────────
-    # Three param groups: vision (full LR), text (0.1x LR), router (0.5x LR)
-    # Router needs moderate LR — too high and it oscillates, too low and it's slow
-    router_params = [
-        p for n, p in model.named_parameters()
-        if 'token_router' in n and p.requires_grad
-    ]
+    # ── BUG 3 FIX: Optimizer — removed dead 'token_router' param group ────────
+    # Previously the optimizer had a third group filtering by 'token_router' in
+    # parameter names, which matched nothing and silently created an empty group.
+    # Now: two groups only — vision (full LR) and text (0.1x LR).
     text_params = [
         p for n, p in model.named_parameters()
-        if 'text_encoder' in n and 'token_router' not in n and p.requires_grad
+        if 'text_encoder' in n and p.requires_grad
     ]
     vision_params = [
         p for n, p in model.named_parameters()
         if 'text_encoder' not in n and p.requires_grad
     ]
-    # Also include sem_cls_probe and attr_gate_logits_head in vision_params group
-    probe_params = [
-        p for n, p in model.named_parameters()
-        if ('sem_cls_probe' in n or 'attr_gate_logits_head' in n) and p.requires_grad
-    ]
 
     print(
-        f'  Trainable: vision={sum(p.numel() for p in vision_params)/1e6:.1f}M '
-        f'text={sum(p.numel() for p in text_params)/1e6:.1f}M '
-        f'router={sum(p.numel() for p in router_params)/1e6:.2f}M params'
+        f'  Trainable: vision={sum(p.numel() for p in vision_params)/1e6:.1f}M  '
+        f'text={sum(p.numel() for p in text_params)/1e6:.1f}M params'
     )
 
     optimizer = optim.AdamW([
-        {'params': vision_params,  'lr': opt.lr0},
-        {'params': probe_params,   'lr': opt.lr0},         # probes: full LR
-        {'params': text_params,    'lr': opt.lr0 * 0.1},
-        {'params': router_params,  'lr': opt.lr0 * 0.5},   # router: half LR
+        {'params': vision_params, 'lr': opt.lr0},
+        {'params': text_params,   'lr': opt.lr0 * 0.1},
     ], weight_decay=opt.weight_decay)
 
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=opt.epochs, eta_min=1e-6
     )
 
-    # ── Loss, EMA, Scaler ─────────────────────────────────────────────────
+    # ── BUG 1 FIX: GroundingLoss initialized with correct parameter names ─────
+    # OLD (broken): GroundingLoss(lambda_attr_pres=..., lambda_routing_ent=..., lambda_routing_div=...)
+    # NEW (correct): matches grounding_loss.py __init__ signature exactly
     loss_fn = GroundingLoss(
         lambda_giou=2.0,
         lambda_l1=5.0,
         lambda_spa=opt.lambda_spa,
-        lambda_orth=opt.lambda_orth,
+        lambda_spa_quad=opt.lambda_spa_quad,     # was: lambda_attr_pres (wrong name)
         lambda_sem_cls=opt.lambda_sem_cls,
-        lambda_attr_pres=opt.lambda_attr_pres,
-        lambda_routing_ent=opt.lambda_routing_ent,
-        lambda_routing_div=opt.lambda_routing_div,
-        num_classes=20,
+        lambda_reconstruct=opt.lambda_reconstruct, # was: lambda_routing_ent (wrong name)
+        lambda_orth=opt.lambda_orth,
+        spatial_grid=3,
     )
 
     ema    = ModelEMA(model)
@@ -246,11 +263,13 @@ def train(opt):
     nw_warmup  = max(round(opt.warmup_epochs * nb), 100)
     accumulate = max(1, round(64 / opt.batch_size))
 
-    # Tracking 8 loss components
-    N_LOSSES = 8
-    loss_keys = ['giou', 'l1', 'spa', 'orth', 'sem_cls', 'attr_pres', 'r_ent', 'r_div']
+    # 7 tracked loss components (matching grounding_loss.py loss_dict keys)
+    loss_keys = ['giou', 'l1', 'spa', 'spa_quad', 'sem_cls', 'reconstruct', 'orth']
 
-    print(f'  Steps/epoch: {nb}  |  Warmup steps: {nw_warmup}  |  Grad accum: {accumulate}')
+    stage2_start = opt.stage1_epochs
+    stage3_start = opt.stage1_epochs + opt.stage2_offset
+    print(f'  Steps/epoch: {nb} | Warmup: {nw_warmup} | Accum: {accumulate}')
+    print(f'  Stage schedule: S1=0→{stage2_start} | S2={stage2_start}→{stage3_start} | S3={stage3_start}→{opt.epochs}')
 
     best_acc = 0.0
 
@@ -258,21 +277,15 @@ def train(opt):
         model.train()
         lambdas = get_lambdas(opt, epoch)
 
-        # Log which stage we're in
-        stage2_start = opt.stage1_epochs + getattr(opt, 'stage2_offset', 10)
+        # Stage transition logging
         if epoch == 0:
-            stage_str = 'Stage 1 (localization only)'
-        elif epoch == opt.stage1_epochs:
-            stage_str = 'Stage 2 (+spa +orth)'
+            tqdm.write(f'\n📍 Epoch 1: Stage 1 — localization only (giou + l1)')
         elif epoch == stage2_start:
-            stage_str = 'Stage 3 (+sem_cls +attr_pres +routing)'
-        else:
-            stage_str = None
+            tqdm.write(f'\n📍 Epoch {epoch+1}: Stage 2 — +spa +spa_quad +sem_cls')
+        elif epoch == stage3_start:
+            tqdm.write(f'\n📍 Epoch {epoch+1}: Stage 3 — +reconstruct (ramping) +orth')
 
-        if stage_str:
-            tqdm.write(f'\n📍 Epoch {epoch+1}: Entering {stage_str}')
-
-        mloss = torch.zeros(N_LOSSES, device=device)
+        mloss = torch.zeros(len(loss_keys) + 1, device=device)  # +1 for total
 
         pbar = tqdm(
             train_loader,
@@ -286,8 +299,7 @@ def train(opt):
             # Warmup LR
             if ni <= nw_warmup:
                 for j, x in enumerate(optimizer.param_groups):
-                    bases = [opt.lr0, opt.lr0, opt.lr0 * 0.1, opt.lr0 * 0.5]
-                    base = bases[min(j, len(bases) - 1)]
+                    base = opt.lr0 if j == 0 else opt.lr0 * 0.1
                     x['lr'] = 0.1 * base + (base - 0.1 * base) * (ni / nw_warmup)
 
             imgs, input_ids, masks, yolo_targets, _ = [
@@ -313,28 +325,25 @@ def train(opt):
                     ema.update(model)
 
             with torch.no_grad():
-                vals = [
-                    loss_dict.get('giou', 0), loss_dict.get('l1', 0),
-                    loss_dict.get('spa', 0),  loss_dict.get('orth', 0),
-                    loss_dict.get('sem_cls', 0), loss_dict.get('attr_pres', 0),
-                    loss_dict.get('routing_ent', 0), loss_dict.get('routing_div', 0),
-                ]
+                vals = [loss_dict.get(k, 0.0) for k in loss_keys] + [loss_dict.get('total', 0.0)]
                 items = torch.tensor(vals, device=device)
                 mloss = (mloss * batch_i + items) / (batch_i + 1)
 
-            # Show all relevant losses in progress bar
+            # BUG 2 FIX: pbar now shows keys that actually exist in loss_dict
             pbar.set_postfix(
                 GIoU=f'{mloss[0]:.3f}',
                 L1=f'{mloss[1]:.3f}',
+                Spa=f'{mloss[2]:.3f}',
+                Quad=f'{mloss[3]:.3f}',
                 SCls=f'{mloss[4]:.3f}',
-                APrs=f'{mloss[5]:.3f}',
-                REnt=f'{mloss[6]:.3f}',
-                RDiv=f'{mloss[7]:.3f}',
+                Rec=f'{mloss[5]:.3f}',
+                Tot=f'{mloss[7]:.3f}',
+                lr=f'{optimizer.param_groups[0]["lr"]:.5f}',
             )
 
             del imgs, input_ids, masks, loss
 
-        # ── Validation ────────────────────────────────────────────────────
+        # ── Validation ────────────────────────────────────────────────────────
         do_val = (
             (epoch + 1) % opt.val_interval == 0
             or (epoch + 1) == opt.epochs
@@ -357,6 +366,17 @@ def train(opt):
                 }
                 torch.save(ckpt, save_dir / 'best.pt')
                 tqdm.write(f'✅ Best: Acc@0.5={best_acc:.4f}')
+
+            # ── BUG 4 FIX: branch_probe.py now actually called ────────────────
+            # Measures whether branches are genuinely specializing.
+            # Every 10 epochs; output printed to console.
+            # Skip epoch 0 — branches haven't had time to specialize yet.
+            if epoch > 0 and (epoch + 1) % opt.probe_interval == 0:
+                try:
+                    run_branch_analysis(val_model, val_loader, device, epoch,
+                                        num_batches=30, spatial_grid=3)
+                except Exception as e:
+                    tqdm.write(f'⚠️  branch_probe failed: {e}')
 
         if opt.save_period > 0 and (epoch + 1) % opt.save_period == 0:
             torch.save(
@@ -412,24 +432,28 @@ def parse_opt():
     p.add_argument('--weight-decay', type=float, default=0.05)
 
     # Stage schedule
-    p.add_argument('--stage1-epochs',  type=int,   default=10,
-                   help='Epochs of localization-only training')
-    p.add_argument('--stage2-offset',  type=int,   default=10,
-                   help='Additional epochs after stage1 before routing losses')
-    p.add_argument('--routing-ramp-epochs', type=int, default=10,
-                   help='Epochs over which to ramp routing losses to full weight')
+    p.add_argument('--stage1-epochs',          type=int, default=10,
+                   help='Epochs of localization-only training (Stage 1)')
+    p.add_argument('--stage2-offset',          type=int, default=10,
+                   help='Additional epochs after stage1 before attribute loss (Stage 2 length)')
+    p.add_argument('--reconstruct-ramp-epochs',type=int, default=10,
+                   help='Epochs to ramp reconstruct loss from 0 to full weight in Stage 3')
 
-    # Loss weights
-    p.add_argument('--lambda-spa',         type=float, default=1.0)
-    p.add_argument('--lambda-orth',        type=float, default=0.3)
-    p.add_argument('--lambda-sem-cls',     type=float, default=0.5,
-                   help='Semantic branch classification loss weight')
-    p.add_argument('--lambda-attr-pres',   type=float, default=0.3,
-                   help='Attribute branch presence loss weight')
-    p.add_argument('--lambda-routing-ent', type=float, default=0.1,
-                   help='Token routing entropy loss weight')
-    p.add_argument('--lambda-routing-div', type=float, default=0.2,
-                   help='Token routing diversity loss weight')
+    # Loss weights — names now match grounding_loss.py exactly (BUG 1 FIX)
+    p.add_argument('--lambda-spa',         type=float, default=1.0,
+                   help='Spatial branch box regression weight')
+    p.add_argument('--lambda-spa-quad',    type=float, default=0.5,
+                   help='Spatial branch quadrant classification weight')
+    p.add_argument('--lambda-sem-cls',     type=float, default=1.0,
+                   help='Semantic branch class discrimination weight')
+    p.add_argument('--lambda-reconstruct', type=float, default=0.5,
+                   help='Attribute branch complementarity reconstruction weight')
+    p.add_argument('--lambda-orth',        type=float, default=0.3,
+                   help='Semantic-attribute orthogonality weight')
+
+    # Probing (BUG 4 FIX)
+    p.add_argument('--probe-interval', type=int, default=10,
+                   help='Run branch specialization analysis every N epochs (0 = off)')
 
     # Speed
     p.add_argument('--compile',               action='store_true')

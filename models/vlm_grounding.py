@@ -1,21 +1,24 @@
 """
-models/vlm_grounding.py  (v2)
+models/vlm_grounding.py  (v3 — fixes KeyError on 'gate' key)
 
-Key change vs v1:
-  The grounding head now receives THREE text streams instead of one:
-    - sem (semantic) sequence  [existing]
-    - attr (attribute) sequence  [NEW — fixes issue 3]
-    - relation_tokens from StructuredPositionPointerEncoder  [NEW — fixes issue 4]
+BUG FIX:
+  OLD: 'gate': txt_out['gate']  ← KeyError
+  The new text_encoder.py (v2, with TokenTypeGatedPooler) removed attr_gate_head
+  entirely. It no longer outputs a 'gate' key. Instead it outputs:
+    'sem_gate':  [B, L]  gate weights for semantic branch
+    'spa_gate':  [B, L]  gate weights for spatial branch
+    'attr_gate': [B, L]  gate weights for attribute branch
+  These are per-token weights for analysis via branch_probe.py.
+  They are NOT used in grounding_loss.py so removing 'gate' from the return
+  dict of vlm_grounding.py has no effect on training.
 
-  This change alone is responsible for fixing issues 3 and 4:
-    - "the longest bridge" fails because the grounding head never saw the
-      attribute branch output — attr_film in FusionNeck modulates feature maps
-      at a coarse level but cannot perform token-level comparative attention.
-    - "B on the right side of A" fails because relation_tokens (already computed
-      by StructuredPositionPointerEncoder) were never forwarded to the grounding
-      head in v1 — they were silently discarded.
+  Also added explicit forwarding of the gate weight outputs so branch_probe.py
+  can read them from the model output dict without needing to call text_encoder
+  a second time.
 
-  Also adds an optional relation_pred_box auxiliary output for L_rel loss.
+  Also added 'sem_cls_logits', 'spa_quadrant_logits', 'reconstructed',
+  'shared_pooled' to the return dict so grounding_loss.py can compute
+  all branch supervision losses from the top-level model output.
 """
 
 import torch
@@ -30,7 +33,7 @@ from models.grounding_head import GroundingHead
 class RelationBoxHead(nn.Module):
     """
     Lightweight MLP that predicts a box from the relation vector.
-    Used only for the auxiliary L_rel loss; not used during inference.
+    Used for the auxiliary L_rel loss only.
     """
     def __init__(self, hidden_dim: int):
         super().__init__()
@@ -47,10 +50,6 @@ class RelationBoxHead(nn.Module):
 
 class RemoteSensingVLM(nn.Module):
     def __init__(self, cfg: dict):
-        """
-        cfg keys (same as v1 plus):
-            n_dec_layers (int) : grounding decoder depth, default 3
-        """
         super().__init__()
 
         # ── Text encoder ──────────────────────────────────────────────────────
@@ -83,9 +82,8 @@ class RemoteSensingVLM(nn.Module):
             n_dec_layers = cfg.get('n_dec_layers', 3),
         )
 
-        # ── Auxiliary relation box head (for L_rel loss) ──────────────────────
+        # ── Auxiliary relation box head ────────────────────────────────────────
         self.relation_box_head = RelationBoxHead(hidden_dim)
-        # Project relation_vec (text_dim) → hidden_dim before the MLP
         self.relation_vec_proj = nn.Sequential(
             nn.Linear(text_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -110,18 +108,12 @@ class RemoteSensingVLM(nn.Module):
         """
         Args:
             imgs  : [B, 3, H, W]
-            texts : (input_ids [B,L], attention_mask [B,L])
-                    OR list of raw strings
+            texts : (input_ids [B,L], attention_mask [B,L])  OR list of strings
 
-        Returns dict:
-            pred_box          : [B, 4]  PRIMARY output  (cx,cy,w,h normalised)
-            txt_pred_box      : [B, 4]  text-spatial auxiliary
-            relation_pred_box : [B, 4]  relation auxiliary (for L_rel)
-            sem_vec / spa_vec / attr_vec : [B, D]
-            gate              : [B, 1]
-            mask              : [B, L]
-            sem               : [B, L, D]  semantic sequence
-            attn_map          : [B, N] pooling weights from grounding head
+        Returns dict with ALL keys needed by:
+            - grounding_loss.py  (pred_box, txt_pred_box, sem_cls_logits, ...)
+            - branch_probe.py    (sem_vec, spa_vec, attr_vec, sem_gate, spa_gate, attr_gate)
+            - val.py             (pred_box)
         """
         # ── Text encoding ─────────────────────────────────────────────────────
         txt_out = self.text_encoder(texts)
@@ -132,33 +124,51 @@ class RemoteSensingVLM(nn.Module):
         # ── Multi-modal fusion neck ───────────────────────────────────────────
         fused_feats = self.neck(raw_feats, txt_out)  # [F3, N4, N5]
 
-        # ── Relation auxiliary prediction (before grounding head) ─────────────
-        # relation_vec: [B, text_dim] from StructuredPositionPointerEncoder
-        rel_vec_proj = self.relation_vec_proj(txt_out['relation_vec'])  # [B, hidden_dim]
-        relation_pred_box = self.relation_box_head(rel_vec_proj)         # [B, 4]
+        # ── Relation auxiliary prediction ─────────────────────────────────────
+        rel_vec_proj      = self.relation_vec_proj(txt_out['relation_vec'])
+        relation_pred_box = self.relation_box_head(rel_vec_proj)
 
-        # ── Grounding head (multi-source iterative decoder) ───────────────────
-        # relation_tokens: [B, K, text_dim]  (K = num_pointers - 1 = 3)
+        # ── Grounding head ────────────────────────────────────────────────────
         pred_box, attn_map = self.grounding_head(
             feats       = fused_feats,
             text_vec    = txt_out['sem_vec'],
-            text_seq    = txt_out['sem'],           # semantic sequence
+            text_seq    = txt_out['sem'],
             text_mask   = txt_out['mask'],
-            attr_seq    = txt_out['attr'],          # ← attribute sequence  [FIX issue 3]
-            attr_mask   = txt_out['mask'],          # same tokenisation → same mask
-            rel_tokens  = txt_out['relation_tokens'],  # ← spatial relation tokens [FIX issue 4]
+            attr_seq    = txt_out['attr'],
+            attr_mask   = txt_out['mask'],
+            rel_tokens  = txt_out['relation_tokens'],
         )
 
+        # ── Build return dict ─────────────────────────────────────────────────
+        # BUG FIX: removed 'gate': txt_out['gate']  (key doesn't exist in v2 text encoder)
+        # Added: sem_gate, spa_gate, attr_gate (the per-token gate weights)
+        # Added: sem_cls_logits, spa_quadrant_logits, reconstructed, shared_pooled
+        #        so grounding_loss.py can compute all branch supervision losses
+        #        directly from the top-level model output dict.
         return {
-            'pred_box':          pred_box,                  # PRIMARY
-            'txt_pred_box':      txt_out['pred_box'],       # text-spatial branch
-            'relation_pred_box': relation_pred_box,         # relation branch
-            'sem_vec':           txt_out['sem_vec'],
-            'spa_vec':           txt_out['spa_vec'],
-            'attr_vec':          txt_out['attr_vec'],
-            'relation_vec':      txt_out['relation_vec'],
-            'gate':              txt_out['gate'],
-            'mask':              txt_out['mask'],
-            'sem':               txt_out['sem'],
-            'attn_map':          attn_map,
+            # PRIMARY output
+            'pred_box':             pred_box,                       # [B, 4]
+            # Auxiliary box predictions (for branch supervision losses)
+            'txt_pred_box':         txt_out['pred_box'],            # [B, 4] spatial branch
+            'relation_pred_box':    relation_pred_box,              # [B, 4] relation branch
+            # Branch supervision logits (consumed by grounding_loss.py)
+            'sem_cls_logits':       txt_out['sem_cls_logits'],      # [B, 20]
+            'spa_quadrant_logits':  txt_out['spa_quadrant_logits'], # [B, 9]
+            'reconstructed':        txt_out['reconstructed'],       # [B, D]
+            'shared_pooled':        txt_out['shared_pooled'],       # [B, D]
+            # Branch vectors (for grounding_loss orth + for branch_probe.py)
+            'sem_vec':              txt_out['sem_vec'],             # [B, D]
+            'spa_vec':              txt_out['spa_vec'],             # [B, D]
+            'attr_vec':             txt_out['attr_vec'],            # [B, D]
+            # Gate weights (for branch_probe.py analysis only)
+            'sem_gate':             txt_out['sem_gate'],            # [B, L]
+            'spa_gate':             txt_out['spa_gate'],            # [B, L]
+            'attr_gate':            txt_out['attr_gate'],           # [B, L]
+            # Spatial relation
+            'relation_vec':         txt_out['relation_vec'],        # [B, D]
+            # Mask and sequences
+            'mask':                 txt_out['mask'],                # [B, L]
+            'sem':                  txt_out['sem'],                 # [B, L, D]
+            # Attention map from grounding head (for visualization)
+            'attn_map':             attn_map,                       # [B, N]
         }
