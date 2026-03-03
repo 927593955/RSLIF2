@@ -1,33 +1,26 @@
 """
-utils/branch_probe.py
+utils/branch_probe.py  (v2 — fixes gradient error in probe_accuracy)
 
-PROBLEM 3 FIX: Specialization is unverified.
+BUG FIXED:
+  run_branch_analysis is decorated @torch.no_grad(), which disables the
+  gradient engine globally for the entire function body.
+  Inside it, probe_accuracy creates a linear layer and calls loss.backward()
+  — but no computation graph exists under no_grad, so backward raises:
+    "element 0 of tensors does not require grad and does not have a grad_fn"
 
-This module provides concrete measurements of branch specialization:
+FIX:
+  probe_accuracy now wraps the training loop in torch.enable_grad(), which
+  temporarily re-enables gradients even inside the outer no_grad scope.
+  The feature tensors are still detached (we only want to probe the frozen
+  representations, not fine-tune the model), so the fix is:
 
-1. GateEntropyAnalyzer:
-   - Measures entropy of each branch's token gate weights
-   - Low entropy = focused on few tokens (specialized)
-   - High entropy = diffuse attention (not specialized)
-   - Reports which token POSITIONS each branch focuses on
-   - Lets you verify: does the spatial gate really focus on position tokens?
+    with torch.enable_grad():
+        loss = F.cross_entropy(probe(features), targets)
+        loss.backward()
 
-2. BranchProbe:
-   - Trains lightweight linear probes on frozen branch vectors
-   - Measures: can sem_vec predict class? (should be YES)
-   - Measures: can spa_vec predict quadrant? (should be YES)
-   - Measures: can attr_vec predict class? (should be LOW)
-   - Measures: can sem_vec predict quadrant? (should be LOW)
-   - Decoupled accuracy = specialization confirmed
-
-3. run_branch_analysis():
-   - Run after each validation epoch to log specialization metrics
-   - Call from val.py or train.py
-
-Usage:
-    from utils.branch_probe import run_branch_analysis
-    # In your validation loop, after validate():
-    run_branch_analysis(model, val_loader, device, epoch)
+  Note: remove .detach() from probe(features) inside the enable_grad block —
+  features are already detached tensors collected under no_grad, so calling
+  .detach() again is a no-op, but leaving it in makes the intent clearer.
 """
 
 import torch
@@ -43,18 +36,6 @@ from collections import defaultdict
 # =============================================================================
 
 class GateEntropyAnalyzer:
-    """
-    Collects gate weight tensors from a forward pass and computes entropy.
-    
-    Usage:
-        analyzer = GateEntropyAnalyzer()
-        # Run a batch through the model
-        output = model(imgs, texts)
-        analyzer.update(output)
-        stats = analyzer.compute()
-        print(stats)
-    """
-
     def __init__(self):
         self.sem_gates  = []
         self.spa_gates  = []
@@ -62,34 +43,26 @@ class GateEntropyAnalyzer:
 
     @torch.no_grad()
     def update(self, model_output: dict):
-        """Accumulate gate weights from a model forward pass."""
         if 'sem_gate' in model_output:
-            self.sem_gates.append(model_output['sem_gate'].cpu())   # [B, L]
+            self.sem_gates.append(model_output['sem_gate'].cpu())
         if 'spa_gate' in model_output:
             self.spa_gates.append(model_output['spa_gate'].cpu())
         if 'attr_gate' in model_output:
             self.attr_gates.append(model_output['attr_gate'].cpu())
 
     def _gate_entropy(self, gates_list):
-        """Mean entropy of gate distributions. Lower = more focused."""
         if not gates_list:
             return float('nan')
-        gates = torch.cat(gates_list, dim=0)      # [N, L]
-        # Entropy: -sum(p * log(p))
-        # Gates are already softmax, so they sum to 1
+        gates = torch.cat(gates_list, dim=0)
         eps = 1e-10
-        entropy = -(gates * (gates + eps).log()).sum(dim=-1)  # [N]
+        entropy = -(gates * (gates + eps).log()).sum(dim=-1)
         return entropy.mean().item()
 
     def _peak_position_bias(self, gates_list, seq_len):
-        """
-        For each position in the sequence, how often is it the argmax gate?
-        Returns normalized position preference histogram.
-        """
         if not gates_list:
             return None
-        gates = torch.cat(gates_list, dim=0)   # [N, L]
-        argmax = gates.argmax(dim=-1)           # [N]
+        gates = torch.cat(gates_list, dim=0)
+        argmax = gates.argmax(dim=-1)
         hist = torch.zeros(seq_len)
         for pos in argmax:
             if pos < seq_len:
@@ -97,17 +70,7 @@ class GateEntropyAnalyzer:
         return (hist / hist.sum()).tolist()
 
     def compute(self, seq_len=77):
-        """
-        Returns dict of entropy and positional statistics.
-        
-        Interpretation:
-          - sem entropy LOW (<2.0): semantic gate is focusing on specific tokens ✓
-          - spa entropy LOW (<2.0): spatial gate is focusing on position tokens ✓
-          - If all entropies are equal and high: branches not specializing ✗
-        """
-        # Maximum possible entropy for L tokens = log(L)
         max_entropy = np.log(seq_len)
-
         sem_ent  = self._gate_entropy(self.sem_gates)
         spa_ent  = self._gate_entropy(self.spa_gates)
         attr_ent = self._gate_entropy(self.attr_gates)
@@ -118,14 +81,12 @@ class GateEntropyAnalyzer:
                 'spatial':   spa_ent,
                 'attribute': attr_ent,
                 'max_possible': max_entropy,
-                # Normalized to [0,1]: 0=perfectly focused, 1=fully uniform
                 'sem_norm':  sem_ent  / max_entropy if not np.isnan(sem_ent)  else None,
                 'spa_norm':  spa_ent  / max_entropy if not np.isnan(spa_ent)  else None,
                 'attr_norm': attr_ent / max_entropy if not np.isnan(attr_ent) else None,
             }
         }
 
-        # Position histograms (first 20 positions for display)
         sem_hist  = self._peak_position_bias(self.sem_gates,  seq_len)
         spa_hist  = self._peak_position_bias(self.spa_gates,  seq_len)
         attr_hist = self._peak_position_bias(self.attr_gates, seq_len)
@@ -146,29 +107,13 @@ class GateEntropyAnalyzer:
 
 
 # =============================================================================
-# 2. Branch Probe (linear probing for specialization measurement)
+# 2. Branch Probe
 # =============================================================================
 
 class BranchProbe(nn.Module):
-    """
-    Lightweight linear probes that measure what each branch has learned.
-
-    Train these probes on the FROZEN branch vectors.
-    High probe accuracy = branch encodes that information.
-    Low probe accuracy = branch does NOT encode that information.
-
-    Expected results if branches are specialized:
-        sem_vec -> class_id:  HIGH accuracy (~DIOR 20-class accuracy)
-        spa_vec -> quadrant:  HIGH accuracy (~9-class grid cell)
-        attr_vec -> class_id: LOW accuracy (attribute ≠ class category)
-        sem_vec -> quadrant:  LOW accuracy (semantic ≠ location)
-    """
-
     def __init__(self, hidden_dim, num_classes=20, spatial_grid=3):
         super().__init__()
         num_quads = spatial_grid * spatial_grid
-
-        # One probe per (branch, task) combination
         self.sem_cls_probe   = nn.Linear(hidden_dim, num_classes)
         self.sem_quad_probe  = nn.Linear(hidden_dim, num_quads)
         self.spa_cls_probe   = nn.Linear(hidden_dim, num_classes)
@@ -188,7 +133,7 @@ class BranchProbe(nn.Module):
 
 
 # =============================================================================
-# 3. run_branch_analysis: plug into your training loop
+# 3. run_branch_analysis
 # =============================================================================
 
 @torch.no_grad()
@@ -196,20 +141,12 @@ def run_branch_analysis(model, val_loader, device, epoch,
                         num_batches=50, spatial_grid=3):
     """
     Run after validation to log branch specialization metrics.
-
-    Outputs:
-      1. Gate entropy per branch (lower is more specialized)
-      2. Token position histogram peaks
-      3. Inline classification accuracy report
-
-    Typical usage in train.py, after validate():
-        if (epoch + 1) % 10 == 0:
-            run_branch_analysis(model, val_loader, device, epoch)
+    The outer @torch.no_grad() covers feature collection.
+    probe_accuracy uses torch.enable_grad() internally for probe training.
     """
     model.eval()
     analyzer = GateEntropyAnalyzer()
 
-    # Collect branch vectors and targets
     sem_vecs, spa_vecs, attr_vecs = [], [], []
     cls_ids, quad_ids = [], []
 
@@ -218,20 +155,14 @@ def run_branch_analysis(model, val_loader, device, epoch,
             break
 
         imgs, input_ids, masks, targets, _ = [x.to(device) for x in batch]
-
         output = model(imgs, [input_ids, masks])
-
         analyzer.update(output)
 
-        # Collect branch vectors
         sem_vecs.append(output['sem_vec'].cpu())
         spa_vecs.append(output['spa_vec'].cpu())
         attr_vecs.append(output['attr_vec'].cpu())
 
-        # Collect GT class and quadrant per sample
         B = imgs.shape[0]
-        batch_cls  = []
-        batch_quad = []
         for si in range(B):
             rows = targets[targets[:, 0].long() == si]
             if len(rows) > 0:
@@ -244,13 +175,10 @@ def run_branch_analysis(model, val_loader, device, epoch,
             else:
                 cls_id  = 0
                 quad_id = 0
-            batch_cls.append(cls_id)
-            batch_quad.append(quad_id)
+            cls_ids.append(cls_id)
+            quad_ids.append(quad_id)
 
-        cls_ids.extend(batch_cls)
-        quad_ids.extend(batch_quad)
-
-    # ── Gate entropy analysis ────────────────────────────────────────────────
+    # ── Gate entropy ─────────────────────────────────────────────────────────
     gate_stats = analyzer.compute()
     print(f'\n📊 Branch Analysis — Epoch {epoch + 1}')
     print('─' * 60)
@@ -269,11 +197,10 @@ def run_branch_analysis(model, val_loader, device, epoch,
         print(f'    Spatial   : {pos["spatial"]}')
         print(f'    Attribute : {pos["attribute"]}')
 
-    # ── Linear probing ────────────────────────────────────────────────────────
     if not sem_vecs:
         return gate_stats
 
-    sem_v  = torch.cat(sem_vecs,  0)   # [N, D]
+    sem_v  = torch.cat(sem_vecs,  0)
     spa_v  = torch.cat(spa_vecs,  0)
     attr_v = torch.cat(attr_vecs, 0)
     cls_t  = torch.tensor(cls_ids,  dtype=torch.long)
@@ -284,19 +211,43 @@ def run_branch_analysis(model, val_loader, device, epoch,
     num_quads   = spatial_grid * spatial_grid
 
     def probe_accuracy(features, targets, num_classes, steps=100, lr=0.01):
-        """Train a quick linear probe and return accuracy."""
-        features = features.to(device)
-        targets  = targets.to(device)
-        probe = nn.Linear(hidden_dim, num_classes).to(device)
+        """
+        Train a linear probe on FROZEN branch vectors.
+
+        FIX: run_branch_analysis is decorated @torch.no_grad(), which disables
+        the gradient engine for the entire function.  We must re-enable it here
+        with torch.enable_grad() so that the probe's parameters accumulate
+        gradients and loss.backward() works.
+
+        The branch vectors (features) are already detached — they were collected
+        under no_grad — so this only adds gradients for the probe itself, not
+        for the model being evaluated.
+        """
+        features_cpu = features.float()   # already detached (collected under no_grad)
+        targets_cpu  = targets
+
+        probe = nn.Linear(hidden_dim, num_classes)
         opt   = torch.optim.Adam(probe.parameters(), lr=lr)
-        for _ in range(steps):
-            opt.zero_grad()
-            loss = F.cross_entropy(probe(features.detach()), targets)
-            loss.backward()
-            opt.step()
+
+        # ── Probe training requires gradients ─────────────────────────────────
+        with torch.enable_grad():
+            probe_device = device
+            probe = probe.to(probe_device)
+            feat_d = features_cpu.to(probe_device)
+            tgt_d  = targets_cpu.to(probe_device)
+
+            for _ in range(steps):
+                opt.zero_grad()
+                # features are detached; only probe.weight/bias get gradients
+                loss = F.cross_entropy(probe(feat_d), tgt_d)
+                loss.backward()
+                opt.step()
+
+        # ── Accuracy evaluation (no grad needed) ──────────────────────────────
         with torch.no_grad():
-            preds = probe(features.detach()).argmax(dim=-1)
-            acc   = (preds == targets).float().mean().item()
+            preds = probe(feat_d).argmax(dim=-1)
+            acc   = (preds == tgt_d).float().mean().item()
+
         return acc
 
     print('\n  Linear Probe Accuracy (specialization measurement):')
